@@ -32,6 +32,8 @@ The docker plugin is used to create the VPP tap interface which is attached to t
 2. Start the plugin
 
         sudo ./vpp &
+        
+   Note: Enable password less sudo to ensure the plugin will run in the background without prompting.
 
 3. Try VPP with Clear Containers
    Note this is based on the example https://wiki.fd.io/view/VPP/Configure_VPP_TAP_Interfaces_For_Container_Routing
