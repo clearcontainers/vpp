@@ -119,6 +119,7 @@ func handlerGetCapabilities(w http.ResponseWriter, r *http.Request) {
 
 func handlerCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	resp := api.CreateNetworkResponse{}
+	bridge := "br"
 
 	body, err := getBody(r)
 	if err != nil {
@@ -130,21 +131,6 @@ func handlerCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	req := api.CreateNetworkRequest{}
 	if err := json.Unmarshal(body, &req); err != nil {
 		resp.Err = "Error: " + err.Error()
-		sendResponse(resp, w)
-		return
-	}
-
-	//TODO: We can auto generate this, in the future. Just needs to be unique
-	v, ok := req.Options["com.docker.network.generic"].(map[string]interface{})
-	if !ok {
-		resp.Err = "Error: network options incorrect or unspecified. Please provide bridge info"
-		sendResponse(resp, w)
-		return
-	}
-
-	bridge, ok := v["bridge"].(string)
-	if !ok {
-		resp.Err = "Error: network incorrect or unspecified. Please provide bridge info"
 		sendResponse(resp, w)
 		return
 	}
