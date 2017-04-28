@@ -9,7 +9,9 @@ https://clearlinux.org/clear-containers
 For more information about VPP
 https://wiki.fd.io/view/VPP
 
-The docker plugin is used to create the VPP vhost-user interface which is attached to the clear container
+The docker plugin is used to create the VPP vhost-user interface which is attached to the clear container.
+Example below assumes you are using a Clear Container which has VPP enabling.  This can be found at
+https://github.com/egernst/cc-oci-runtime/tree/vhostuser-network-enabling
 
 # How to use this plugin
 
