@@ -1,0 +1,19 @@
+FROM ubuntu:16.04
+
+ARG DPDK_VER=17.02
+ARG DPDK_TARGET=x86_64-native-linuxapp-gcc
+
+RUN apt-get update && apt-get -y install \
+  build-essential \
+  ifupdown \
+  lshw \
+  net-tools \
+  python \
+  pciutils \
+  vim
+ADD http://fast.dpdk.org/rel/dpdk-${DPDK_VER}.tar.xz /opt
+WORKDIR /opt
+RUN tar -xf dpdk-${DPDK_VER}.tar.xz && mv dpdk-${DPDK_VER} dpdk && cd dpdk && \
+    sed -ri 's,(IGB_UIO=).*,\1n,' config/common_linuxapp && \
+    sed -ri 's,(KNI_KMOD=).*,\1n,' config/common_linuxapp && \
+make config T=${DPDK_TARGET} && make -j && mkdir /mnt/huge
