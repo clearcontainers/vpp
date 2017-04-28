@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2016 Intel Corporation
+// Copyright (c) 2017 Intel Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,17 +39,17 @@ import (
 )
 
 type epVal struct {
-	IP        string
-	vppTap    string //The interface visible to linux
-	vppIntTap string //The vpp internal representation
+	IP      string
+	vhostuserPort string //The dpdk vhost user port
+	vppInterface   string
 }
 
 type nwVal struct {
-	Bridge  string
+	Bridge  string //The bridge on which the ports will be created
 	Gateway net.IPNet
 }
 
-var counter int
+var intfCounter int
 
 var epMap struct {
 	sync.Mutex
@@ -61,13 +61,21 @@ var nwMap struct {
 	m map[string]*nwVal
 }
 
+var brMap struct {
+	sync.Mutex
+	br_count int
+	m map[string]int
+}
+
 var dbFile string
 var db *bolt.DB
 
 func init() {
 	epMap.m = make(map[string]*epVal)
 	nwMap.m = make(map[string]*nwVal)
-	dbFile = "/tmp/bolt.db"
+	brMap.m = make(map[string]int)
+	brMap.br_count = 1
+	dbFile = "/tmp/dpdk_bolt.db"
 }
 
 //We should never see any errors in this function
@@ -126,6 +134,7 @@ func handlerCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//TODO: We can auto generate this, in the future. Just needs to be unique
 	v, ok := req.Options["com.docker.network.generic"].(map[string]interface{})
 	if !ok {
 		resp.Err = "Error: network options incorrect or unspecified. Please provide bridge info"
@@ -154,6 +163,16 @@ func handlerCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		glog.Errorf("Unable to update db %v", err)
 	}
 
+	// For VPP, we are connecting endpoints via a bridge which requires
+	// a unique integer ID.
+	brMap.Lock()
+	brMap.m[req.NetworkID] = brMap.br_count
+	brMap.br_count = brMap.br_count + 1
+	if err := dbAdd("brMap", req.NetworkID, brMap.m[req.NetworkID]); err != nil {
+		glog.Errorf("Unable to update db %v", err)
+	}
+	brMap.Unlock()
+
 	sendResponse(resp, w)
 }
 
@@ -176,16 +195,21 @@ func handlerDeleteNetwork(w http.ResponseWriter, r *http.Request) {
 
 	glog.Infof("Delete Network := %v", req.NetworkID)
 
-	//This would have already been done in the SDN controller
-	//Remove the UUID to bridge mapping in cache and in the
-	//persistent data store
 	nwMap.Lock()
+	defer nwMap.Unlock()
+
 	bridge := nwMap.m[req.NetworkID].Bridge
 	delete(nwMap.m, req.NetworkID)
 	if err := dbDelete("nwMap", req.NetworkID); err != nil {
 		glog.Errorf("Unable to update db %v %v", err, bridge)
 	}
-	nwMap.Unlock()
+
+	brMap.Lock()
+	delete(brMap.m, req.NetworkID)
+	if err := dbDelete("brMap", req.NetworkID); err != nil {
+		glog.Errorf("Unable to update db %v %v", err, bridge)
+	}
+	brMap.Unlock()
 
 	sendResponse(resp, w)
 	return
@@ -244,20 +268,31 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nwMap.Lock()
+	bridge := nwMap.m[req.NetworkID].Bridge
+	nwMap.Unlock()
+
+	if bridge == "" {
+		resp.Err = "Error: incompatible network"
+		sendResponse(resp, w)
+		return
+	}
+
+	nwMap.Lock()
 	defer nwMap.Unlock()
 
 	epMap.Lock()
 	defer epMap.Unlock()
 
-	//These are setup by the SDN controller
-	counter++
-	vppTap := fmt.Sprintf("vpptap%d", counter)
+	brMap.Lock()
+	defer brMap.Unlock()
 
-	// This would have been done in the SDN controller
-	// Just update the cache and persistent data base
+	//Generate a unique vhost-user port name
+	vhost_port := fmt.Sprintf("v_%s", ip)
+
+	//Generate VPP-dpdk vhost-user interface:
 	cmd := "vppctl"
-	args := []string{"tap", "connect", vppTap}
-	bvtap, err := exec.Command(cmd, args...).Output()
+	args := []string{"create", "vhost", "socket", fmt.Sprintf("/tmp/%s", vhost_port), "server"}
+	bifc, err := exec.Command(cmd, args...).Output()
 	if err != nil {
 		glog.Infof("ERROR: [%v] [%v] [%v] ", cmd, args, err)
 		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
@@ -265,53 +300,63 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 		sendResponse(resp, w)
 		return
 	}
-	vtapb, _, err := bufio.NewReader(bytes.NewReader(bvtap)).ReadLine()
-	vtap := string(vtapb)
 
-	glog.Infof("Created vpp tap %v %v %v", vppTap, vtap, err)
+	ifcb, _, err := bufio.NewReader(bytes.NewReader(bifc)).ReadLine()
+	ifc := string(ifcb)
+
+	glog.Infof("Created vhost-user interface %v %v", ifc, err)
+
+	//Set Interface state to up
+	cmd = "vppctl"
+	args = []string{"set", "interface", "state", ifc, "up"}
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
+			cmd, args, err)
+		sendResponse(resp, w)
+		return
+	}
+
+	//Attach VPP vhost-user interface to VPP L2 Bridge Domain
+	//TODO: Need to create a unique bridge domain ID per network
+	cmd = "vppctl"
+	args = []string{"set", "interface", "l2", "bridge", ifc, fmt.Sprint(brMap.m[req.NetworkID])}
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
+			cmd, args, err)
+		sendResponse(resp, w)
+		return
+	}
+
+
+
+	/* Setup the dummy interface corresponding to the dpdk port
+	 * This is done so that docker CNM will program the IP Address
+	 * and other properties on this Interface
+	 * This dummy interface will be discovered by clear containers
+	 * which then maps the actual vhost-user port to the VM
+	 * This is needed today as docker does not pass any information
+	 * from the network plugin to the runtime
+	 */
+	cmd = "ip"
+	args = []string{"link", "add", vhost_port, "type", "dummy"}
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
+			cmd, args, err)
+		sendResponse(resp, w)
+		return
+	}
+
+	glog.Infof("Setup dummy port %v %v ", cmd, args)
 
 	epMap.m[req.EndpointID] = &epVal{
 		IP:        req.Interface.Address,
-		vppTap:    vppTap,
-		vppIntTap: vtap,
+		vhostuserPort:	vhost_port,
+		vppInterface:	ifc,
 	}
 
 	if err := dbAdd("epMap", req.EndpointID, epMap.m[req.EndpointID]); err != nil {
 		glog.Errorf("Unable to update db %v %v", err, ip)
 	}
-	if err := dbAdd("global", "counter", counter); err != nil {
-		glog.Errorf("Unable to update db %v", err)
-	}
-
-	/* Set the far end IP. Assume .1 for now */
-	cmd = "vppctl"
-	glog.Infof("Pre IP = [%v] [%v]", vtap, ip.String())
-	ip4 := ip.To4()
-	ip4[3] = 1
-	glog.Infof("Post IP = [%v] [%v]", vtap, ip4.String())
-
-	args = []string{"set", "int", "ip", "addr", vtap, ip4.String() + "/24"}
-	if err := exec.Command(cmd, args...).Run(); err != nil {
-		glog.Infof("ERROR: [%v] [%v] [%v] ", cmd, ip4.String(), err)
-		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
-			cmd, args, err)
-		sendResponse(resp, w)
-		return
-	}
-
-	glog.Infof("Set vpp tap IP gateway [%v] %v %v ", args, vtap, ip4.String())
-
-	cmd = "vppctl"
-	args = []string{"set", "int", "state", vtap, "up"}
-	if err := exec.Command(cmd, args...).Run(); err != nil {
-		glog.Infof("ERROR: [%v] [%v] [%v] ", cmd, args, err)
-		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
-			cmd, args, err)
-		sendResponse(resp, w)
-		return
-	}
-
-	glog.Infof("Set vpp tap state %v %v %v", vppTap, vtap, args)
 
 	sendResponse(resp, w)
 }
@@ -334,14 +379,50 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	epMap.Lock()
+	nwMap.Lock()
+
 	m := epMap.m[req.EndpointID]
+	vhost_port := m.vhostuserPort
+	vpp_interface := m.vppInterface
+
 	delete(epMap.m, req.EndpointID)
 	if err := dbDelete("epMap", req.EndpointID); err != nil {
 		glog.Errorf("Unable to update db %v %v", err, m)
 	}
+	nwMap.Unlock()
 	epMap.Unlock()
 
-	//Figure out how to a vpp tap delete
+	//put interface into down state
+	cmd := "vppctl"
+	args := []string{"set", "interface", "state", vpp_interface, "down"}
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		resp.Err = fmt.Sprintf("Error DeleteEndpoint: [%v] [%v] [%v]",
+			cmd, args, err)
+		sendResponse(resp, w)
+		return
+	}
+
+	//delete vhost interface
+	cmd = "vppctl"
+	args = []string{"delete", "vhost-user", vpp_interface}
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		resp.Err = fmt.Sprintf("Error DeleteEndpoint: [%v] [%v] [%v]",
+			cmd, args, err)
+		sendResponse(resp, w)
+		return
+	}
+
+	//delete dummy port
+	cmd = "ip"
+	args = []string{"link", "del", vhost_port}
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
+			cmd, args, err)
+		sendResponse(resp, w)
+		return
+	}
+
+	glog.Infof("Deleted dummy port %v %v ", cmd, args)
 
 	sendResponse(resp, w)
 }
@@ -372,10 +453,10 @@ func handlerJoin(w http.ResponseWriter, r *http.Request) {
 
 	resp.Gateway = nm.Gateway.IP.String()
 	resp.InterfaceName = &api.InterfaceName{
-		SrcName:   em.vppTap,
+		SrcName:   em.vhostuserPort,
 		DstPrefix: "eth",
 	}
-	glog.Infof("Join Response %v %v", resp, em.vppTap)
+	glog.Infof("Join Response %v %v", resp, em.vhostuserPort)
 	sendResponse(resp, w)
 }
 
@@ -561,8 +642,6 @@ func ipamRequestAddress(w http.ResponseWriter, r *http.Request) {
 	if req.Address != "" {
 		resp.Address = req.Address + "/24"
 	} else {
-		//DOCKER BUG: The preferred address supplied in --ip does not show up.
-		//Bug fixed in docker 1.11
 		resp.Error = "Error: Request does not have IP address. Specify using --ip"
 	}
 	sendResponse(resp, w)
@@ -694,7 +773,7 @@ func initDb() error {
 		return fmt.Errorf("dbInit failed %v", err)
 	}
 
-	tables := []string{"global", "nwMap", "epMap"}
+	tables := []string{"global", "nwMap", "epMap", "brMap"}
 	if err := dbTableInit(tables); err != nil {
 		return fmt.Errorf("dbInit failed %v", err)
 	}
@@ -702,12 +781,12 @@ func initDb() error {
 	c, err := dbGet("global", "counter")
 	if err != nil {
 		glog.Errorf("dbGet failed %v", err)
-		counter = 100
+		intfCounter = 100
 	} else {
 		var ok bool
-		counter, ok = c.(int)
+		intfCounter, ok = c.(int)
 		if !ok {
-			counter = 100
+			intfCounter = 100
 		}
 	}
 
@@ -747,6 +826,26 @@ func initDb() error {
 		return err
 	})
 
+	if err != nil {
+		return err
+	}
+
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("brMap"))
+
+		err := b.ForEach(func(k, v []byte) error {
+			vr := bytes.NewReader(v)
+			brVal := 0
+			if err := gob.NewDecoder(vr).Decode(&brVal); err != nil {
+				return fmt.Errorf("Decode Error: %v %v %v", string(k), string(v), err)
+			}
+			brMap.m[string(k)] = brVal
+			glog.Infof("brMap key=%v, value=%v\n", string(k), brVal)
+			return nil
+		})
+		return err
+	})
+
 	return err
 }
 
@@ -781,10 +880,9 @@ func main() {
 	r.HandleFunc("/IpamDriver.RequestPool", ipamRequestPool)
 	r.HandleFunc("/IpamDriver.ReleasePool", ipamReleasePool)
 	r.HandleFunc("/IpamDriver.RequestAddress", ipamRequestAddress)
-	r.HandleFunc("/IpamDriver.ReleaseAddress", ipamReleaseAddress)
 
 	r.HandleFunc("/", handler)
-	err := http.ListenAndServe("127.0.0.1:9599", r)
+	err := http.ListenAndServe("127.0.0.1:9075", r)
 	if err != nil {
 		glog.Errorf("docker plugin http server failed, [%v]", err)
 	}
