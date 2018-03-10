@@ -26,6 +26,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -39,9 +40,9 @@ import (
 )
 
 type epVal struct {
-	IP      string
+	IP            string
 	vhostuserPort string //The dpdk vhost user port
-	vppInterface   string
+	vppInterface  string
 }
 
 type nwVal struct {
@@ -63,8 +64,8 @@ var nwMap struct {
 
 var brMap struct {
 	sync.Mutex
-	br_count int
-	m map[string]int
+	brCount int
+	m       map[string]int
 }
 
 var dbFile string
@@ -74,7 +75,7 @@ func init() {
 	epMap.m = make(map[string]*epVal)
 	nwMap.m = make(map[string]*nwVal)
 	brMap.m = make(map[string]int)
-	brMap.br_count = 1
+	brMap.brCount = 1
 	dbFile = "/tmp/dpdk_bolt.db"
 }
 
@@ -152,8 +153,8 @@ func handlerCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	// For VPP, we are connecting endpoints via a bridge which requires
 	// a unique integer ID.
 	brMap.Lock()
-	brMap.m[req.NetworkID] = brMap.br_count
-	brMap.br_count = brMap.br_count + 1
+	brMap.m[req.NetworkID] = brMap.brCount
+	brMap.brCount = brMap.brCount + 1
 	if err := dbAdd("brMap", req.NetworkID, brMap.m[req.NetworkID]); err != nil {
 		glog.Errorf("Unable to update db %v", err)
 	}
@@ -272,12 +273,22 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	brMap.Lock()
 	defer brMap.Unlock()
 
-	//Generate a unique vhost-user port name
-	vhost_port := fmt.Sprintf("v_%s", ip)
+	//Generate a vhost-user port name to use with dummy interface.
+	//We'll use the interfaces IP address
+	vhostPort := fmt.Sprintf("%s", ip)
+
+	//Create a unique path on the host to place the socket
+	socketpath := fmt.Sprintf("/tmp/vhostuser_%s", ip)
+	err = os.Mkdir(socketpath, 0500)
+	if err != nil {
+		resp.Err = fmt.Sprintf("Error making socket path %s: err: %v", socketpath, err)
+		sendResponse(resp, w)
+		return
+	}
 
 	//Generate VPP-dpdk vhost-user interface:
 	cmd := "vppctl"
-	args := []string{"create", "vhost", "socket", fmt.Sprintf("/tmp/%s", vhost_port), "server"}
+	args := []string{"create", "vhost", "socket", fmt.Sprintf("%s/vhu.sock", socketpath), "server"}
 	bifc, err := exec.Command(cmd, args...).Output()
 	if err != nil {
 		glog.Infof("ERROR: [%v] [%v] [%v] ", cmd, args, err)
@@ -313,8 +324,6 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-
-
 	/* Setup the dummy interface corresponding to the dpdk port
 	 * This is done so that docker CNM will program the IP Address
 	 * and other properties on this Interface
@@ -324,7 +333,7 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	 * from the network plugin to the runtime
 	 */
 	cmd = "ip"
-	args = []string{"link", "add", vhost_port, "type", "dummy"}
+	args = []string{"link", "add", vhostPort, "type", "dummy"}
 	if err := exec.Command(cmd, args...).Run(); err != nil {
 		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
 			cmd, args, err)
@@ -335,9 +344,9 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	glog.Infof("Setup dummy port %v %v ", cmd, args)
 
 	epMap.m[req.EndpointID] = &epVal{
-		IP:        req.Interface.Address,
-		vhostuserPort:	vhost_port,
-		vppInterface:	ifc,
+		IP:            req.Interface.Address,
+		vhostuserPort: vhostPort,
+		vppInterface:  ifc,
 	}
 
 	if err := dbAdd("epMap", req.EndpointID, epMap.m[req.EndpointID]); err != nil {
@@ -368,8 +377,8 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	nwMap.Lock()
 
 	m := epMap.m[req.EndpointID]
-	vhost_port := m.vhostuserPort
-	vpp_interface := m.vppInterface
+	vhostPort := m.vhostuserPort
+	vppInterface := m.vppInterface
 
 	delete(epMap.m, req.EndpointID)
 	if err := dbDelete("epMap", req.EndpointID); err != nil {
@@ -380,7 +389,7 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	//put interface into down state
 	cmd := "vppctl"
-	args := []string{"set", "interface", "state", vpp_interface, "down"}
+	args := []string{"set", "interface", "state", vppInterface, "down"}
 	if err := exec.Command(cmd, args...).Run(); err != nil {
 		resp.Err = fmt.Sprintf("Error DeleteEndpoint: [%v] [%v] [%v]",
 			cmd, args, err)
@@ -390,7 +399,7 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	//delete vhost interface
 	cmd = "vppctl"
-	args = []string{"delete", "vhost-user", vpp_interface}
+	args = []string{"delete", "vhost-user", vppInterface}
 	if err := exec.Command(cmd, args...).Run(); err != nil {
 		resp.Err = fmt.Sprintf("Error DeleteEndpoint: [%v] [%v] [%v]",
 			cmd, args, err)
@@ -400,7 +409,7 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	//delete dummy port
 	cmd = "ip"
-	args = []string{"link", "del", vhost_port}
+	args = []string{"link", "del", vhostPort}
 	if err := exec.Command(cmd, args...).Run(); err != nil {
 		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
 			cmd, args, err)
@@ -409,6 +418,15 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	glog.Infof("Deleted dummy port %v %v ", cmd, args)
+
+	// vhostPort contains the IP address
+	os.RemoveAll(fmt.Sprintf("/tmp/vhostuser_%s/", vhostPort))
+	if err != nil {
+		glog.Infof("Couldn't remove /tmp/vhostuser_%s", vhostPort)
+		resp.Err = fmt.Sprintf("Couldn't delete /tmp/vhostuser_%s: %v", vhostPort, err)
+		sendResponse(resp, w)
+		return
+	}
 
 	sendResponse(resp, w)
 }
