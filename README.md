@@ -22,7 +22,7 @@ https://github.com/01org/cc-oci-runtime/tree/networking/vhost-user-poc
 
 1. Ensure that your plugin is discoverable https://docs.docker.com/engine/extend/plugin_api/#/plugin-discovery
 
-        sudo cp vpp.json /etc/docker/plugins
+        sudo cp vpp.json /etc/docker/plugins/
 
 
 2. Start the plugin
